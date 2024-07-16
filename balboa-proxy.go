@@ -8,13 +8,14 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 )
 
 var (
 	dataListenAddr  = flag.String("data-addr", "[::0]:4257", "Listen address for Balboa app connections")
 	discoveryPort   = flag.Int("discovery-port", 30303, "Port to listen for Balboa app discovery broadcasts")
-	discoveryName   = flag.String("discovery-name", "SPAPROXY", "Hostname to report in discovery responses")
-	discoveryMAC    = flag.String("discovery-mac", "00:15:27:00:00:00", "MAC address to report in discovery responses")
+	discoveryName   = flag.String("discovery-name", "BWGSPA", "Hostname to report in discovery responses")
+	discoveryMAC    = flag.String("discovery-mac", "00-15-27-00-00-00", "MAC address to report in discovery responses")
 	forwardAddrFlag = flag.String("forward-addr", "", "Address of Spa module")
 )
 
@@ -57,7 +58,7 @@ func listenDiscovery(ctx context.Context) error {
 	}
 	defer pc.Close()
 
-	response := []byte(fmt.Sprintf("%s\r\n%s\r\n", *discoveryName, *discoveryMAC))
+	response := []byte(fmt.Sprintf("%-10s\r\n%s\r\n", *discoveryName, *discoveryMAC))
 
 	buf := make([]byte, 1024)
 	for ctx.Err() == nil {
@@ -93,46 +94,74 @@ func listenForward(ctx context.Context, forwardAddr net.Addr) error {
 			continue
 		}
 
-		log.Printf("Forwarding from %s", c.RemoteAddr())
-
-		go handleForward(ctx, c, forwardAddr)
+		tc, ok := c.(*net.TCPConn)
+		if !ok {
+			log.Printf("[unexpected] Incoming connection is not a TCPConn")
+		}
+		go handleForward(ctx, tc, forwardAddr)
 	}
 
 	return ctx.Err()
 }
 
-func handleForward(ctx context.Context, c net.Conn, forwardAddr net.Addr) {
+func handleForward(ctx context.Context, c *net.TCPConn, forwardAddr net.Addr) {
 	defer c.Close()
 	var dial net.Dialer
 
+	log.Printf("Forwarding from %s", c.RemoteAddr())
+
 	fc, err := dial.DialContext(ctx, "tcp", forwardAddr.String())
 	if err != nil {
-		log.Printf("Unable to dial %s: %v", forwardAddr, err)
+		log.Printf("Unable to dial %s from %s: %v", forwardAddr, c.RemoteAddr(), err)
 		return
 	}
 	defer fc.Close()
 
+	fwd, ok := fc.(*net.TCPConn)
+	if !ok {
+		log.Printf("[unexpected] Forwarding connection is not a TCPConn")
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go pipe(ctx, c, fc, cancel)
-	pipe(ctx, fc, c, cancel)
+	go pipe(ctx, c, fwd, cancel)
+	pipe(ctx, fwd, c, cancel)
+
+	log.Printf("Forward complete %s", c.RemoteAddr())
 }
 
-func pipe(ctx context.Context, a, b net.Conn, cancel context.CancelFunc) {
+func pipe(ctx context.Context, a, b *net.TCPConn, cancel context.CancelFunc) {
+	defer cancel()
+	defer b.CloseWrite()
+	defer a.CloseRead()
+
 	buf := make([]byte, 4096)
 	for ctx.Err() == nil {
-		n, err := a.Read(buf)
-		if err != nil {
-			log.Printf("Read error (%v->%v): %v", a.RemoteAddr(), b.RemoteAddr(), err)
-			cancel()
+		if err := a.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+			log.Printf("SetReadDeadline (%v->%v): %v", a.RemoteAddr(), b.RemoteAddr(), err)
 			return
 		}
-		_, err = b.Write(buf[:n])
+		n, err := a.Read(buf)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			continue
+		}
 		if err != nil {
-			log.Printf("Write error (%v->%v): %v", a.RemoteAddr(), b.RemoteAddr(), err)
-			cancel()
+			log.Printf("Read error (%v->%v): %v", a.RemoteAddr(), b.RemoteAddr(), err)
 			return
+		}
+		if err := b.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+			log.Printf("SetWriteDeadline (%v->%v): %v", a.RemoteAddr(), b.RemoteAddr(), err)
+			return
+		}
+		var i int
+		for ctx.Err() == nil {
+			tx, err := b.Write(buf[i:n])
+			if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+				log.Printf("Write error (%v->%v): %v", a.RemoteAddr(), b.RemoteAddr(), err)
+				return
+			}
+			i += tx
 		}
 	}
 }
